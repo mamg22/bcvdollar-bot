@@ -1,9 +1,9 @@
 import datetime
 import decimal
+import sqlite3
 
 import aiohttp
 from lxml import html
-import psycopg
 import xlrd
 from yarl import URL
 
@@ -70,33 +70,33 @@ async def get_rate_chunks():
                     yield (get_sheet_rate(sheet) for sheet in book)
 
 
-async def store_rates(db_conn: psycopg.AsyncConnection):
+async def store_rates(db_conn: sqlite3.Connection):
     new_rows = 0
-    async with db_conn.cursor() as acur:
-        async for chunk in get_rate_chunks():
-            await acur.executemany(
-                "INSERT INTO Rates VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                chunk,
-            )
-            await db_conn.commit()
+    cur = db_conn.cursor()
+    async for chunk in get_rate_chunks():
+        cur.executemany(
+            "INSERT INTO Rates VALUES (?, ?) ON CONFLICT DO NOTHING",
+            chunk,
+        )
+        db_conn.commit()
 
-            count = acur.rowcount
-            new_rows += count
+        count = cur.rowcount
+        new_rows += count
 
-            if count == 0:
-                break
+        if count == 0:
+            break
 
     return new_rows
 
 
-async def rate_at(dt: datetime.datetime, db_conn: psycopg.AsyncConnection):
-    async with db_conn.cursor() as acur:
-        await acur.execute(
-            """SELECT effective_at, value
-            FROM Rates
-            WHERE effective_at <= %s
-            ORDER BY effective_at DESC
-            LIMIT 1""",
-            (dt,),
-        )
-        return await acur.fetchone()
+def rate_at(dt: datetime.datetime, db_conn: sqlite3.Connection):
+    cur = db_conn.cursor()
+    cur.execute(
+        """SELECT effective_at, value
+        FROM Rates
+        WHERE effective_at <= ?
+        ORDER BY effective_at DESC
+        LIMIT 1""",
+        (dt,),
+    )
+    return cur.fetchone()

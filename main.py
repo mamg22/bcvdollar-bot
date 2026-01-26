@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import logging
 from os import getenv
+import sqlite3
 import time
 
 import aiohttp
@@ -12,7 +13,7 @@ from aiogram.types import Message, BotCommand
 from dotenv import load_dotenv
 import psycopg
 
-from database import get_db_settings
+from database import create_database, get_db
 import rates
 
 STATS_URL = "https://www.bcv.org.ve/estadisticas/tipo-cambio-de-referencia-smc"
@@ -101,7 +102,7 @@ BsD. {rate:.4f}
 
 @dp.message(Command("rate", "tasa"))
 async def command_rate(
-    message: Message, command: CommandObject, db_conn: psycopg.AsyncConnection
+    message: Message, command: CommandObject, db_conn: sqlite3.Connection
 ) -> None:
     if command.args is not None:
         try:
@@ -118,16 +119,16 @@ async def command_rate(
         await message.answer("No hay tasas de cambio disponibles antes de 2020-03-30")
         return
 
-    async with db_conn.cursor() as acur:
-        await acur.execute(
-            """SELECT effective_at, value
-            FROM Rates
-            WHERE effective_at <= %s
-            ORDER BY effective_at DESC
-            LIMIT 1""",
-            (target_date,),
-        )
-        rate_data = await acur.fetchone()
+    cur = db_conn.cursor()
+    cur.execute(
+        """SELECT effective_at, value
+        FROM Rates
+        WHERE effective_at <= ?
+        ORDER BY effective_at DESC
+        LIMIT 1""",
+        (target_date,),
+    )
+    rate_data = cur.fetchone()
 
     if rate_data is not None:
         date, rate = rate_data
@@ -174,23 +175,25 @@ def get_next_check_delay(short_term: bool) -> float:
     return (next_check - now).total_seconds()
 
 
-async def broadcast_update(bot: Bot, db_conn: psycopg.AsyncConnection, new_rates: int):
-    async with db_conn.cursor() as acur:
-        await acur.execute(
-            """SELECT effective_at, value,
-                value - LAG(value, 1) OVER (ORDER BY effective_at) AS change
-            FROM Rates
-            ORDER BY effective_at DESC
-            LIMIT %s""",
-            (new_rates,),
-        )
-        data = await acur.fetchall()
+async def broadcast_update(bot: Bot, db_conn: sqlite3.Connection, new_rates: int):
+    cur = db_conn.cursor()
+    cur.execute(
+        """SELECT effective_at, value,
+            value - LAG(value, 1) OVER (ORDER BY effective_at) AS change
+        FROM Rates
+        ORDER BY effective_at DESC
+        LIMIT ?""",
+        (min(new_rates, 15),),
+    )
+    data = cur.fetchall()
 
     for rate_data in reversed(data):
         if rate_data is not None:
             date, rate, change = rate_data
         else:
             return
+
+        change = change if change is not None else rate
 
         text = UPDATE_FORMAT.format(
             weekday=WEEKDAYS[date.weekday()], date=date, rate=rate, change=change
@@ -202,7 +205,7 @@ async def broadcast_update(bot: Bot, db_conn: psycopg.AsyncConnection, new_rates
         )
 
 
-async def update_timer(bot: Bot, db_conn: psycopg.AsyncConnection):
+async def update_timer(bot: Bot, db_conn: sqlite3.Connection):
     while True:
         new_rates = await rates.store_rates(db_conn)
         logger.debug(f"Finished checking for rate updates, found {new_rates} new rates")
@@ -254,7 +257,13 @@ async def main() -> None:
     await bot.set_my_commands(commands=COMMANDS_ES, language_code="es")
     await bot.set_my_commands(commands=COMMANDS)
 
-    db_conn = await psycopg.AsyncConnection.connect(get_db_settings())
+    db_conn = sqlite3.connect(
+        get_db(),
+        detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+    )
+    create_database()
+
+    logger.debug(f"Loaded database at {get_db()}")
 
     async with asyncio.TaskGroup() as tg:
         tg.create_task(update_timer(bot, db_conn))
